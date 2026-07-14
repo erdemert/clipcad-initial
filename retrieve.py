@@ -14,9 +14,9 @@ from train import CHECKPOINT_PATH, NUM_WORKERS, _worker_init_fn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
 logger = logging.getLogger("cad_clipper.retrieve")
 
-BATCH_SIZE = 32
+BATCH_SIZE = 512
 TOP_K = 5
-DEFAULT_MAX_SAMPLES = 2000  # keep the candidate pool bounded unless the user asks for more
+DEFAULT_MAX_SAMPLES = 0  # 0 = full validation split; the NxN similarity matrix is trivial memory at this scale
 
 
 @torch.no_grad()

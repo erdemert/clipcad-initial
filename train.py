@@ -13,17 +13,17 @@ from losses import clip_contrastive_loss
 from model import CADClipModel
 from splits import load_train_val_ids
 
-NUM_EPOCHS = 20
-BATCH_SIZE = 16
+NUM_EPOCHS = 100
+BATCH_SIZE = 512
 LR = 1e-4
 RUNS_DIR = Path("runs")
 CHECKPOINT_PATH = Path("checkpoints") / "latest.pt"
 LOG_EVERY_N_STEPS = 20
+PERSISTENT_WORKERS = True
 
-# Leave headroom for the main training process and the OS; on CPU-only
-# machines, workers importing torch each spin up their own BLAS/OpenMP
-# thread pool, so too many workers oversubscribes the cores badly.
-NUM_WORKERS = max(1, min(2, (os.cpu_count() or 2) // 2))
+# Data loading for images at this scale plateaus well before using every core;
+# cap workers rather than spawning one per core.
+NUM_WORKERS = min(32, os.cpu_count() or 8)
 
 
 def _worker_init_fn(_worker_id):
@@ -41,11 +41,11 @@ def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None):
     n_batches_total = len(loader)
     total_loss, n_batches = 0.0, 0
     for step, batch in enumerate(loader):
-        image = batch["image"].to(device)
-        command = batch["command"].to(device)
-        args = batch["args"].to(device)
+        image = batch["image"].to(device, non_blocking=True)
+        command = batch["command"].to(device, non_blocking=True)
+        args = batch["args"].to(device, non_blocking=True)
 
-        with torch.set_grad_enabled(is_train):
+        with torch.set_grad_enabled(is_train), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits_per_image, logits_per_cad = model(image, command, args)
             loss = clip_contrastive_loss(logits_per_image, logits_per_cad)
 
@@ -90,13 +90,16 @@ def main():
     val_set = CADImagePairDataset(cfg, ids=val_ids, image_transform=model.preprocess)
 
     pin_memory = device.type == "cuda"
+    persistent_workers = PERSISTENT_WORKERS and NUM_WORKERS > 0
     train_loader = DataLoader(
         train_set, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=NUM_WORKERS, pin_memory=pin_memory, worker_init_fn=_worker_init_fn,
+        persistent_workers=persistent_workers,
     )
     val_loader = DataLoader(
         val_set, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=pin_memory, worker_init_fn=_worker_init_fn,
+        persistent_workers=persistent_workers,
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
