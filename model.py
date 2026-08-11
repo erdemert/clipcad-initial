@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cad_format import ALL_COMMANDS, ARGS_DIM, DEFAULT_MAX_LEN, EOS_IDX
+from cad_format import ALL_COMMANDS, ARGS_DIM, DEFAULT_MAX_LEN, EOS_IDX, N_ARGS
 
 
 class CADSequenceEncoder(nn.Module):
@@ -15,6 +15,7 @@ class CADSequenceEncoder(nn.Module):
         super().__init__()
         self.cmd_embed = nn.Embedding(len(ALL_COMMANDS), d_model)
         self.arg_embed = nn.Embedding(ARGS_DIM + 2, d_model)  # +1 shift for PAD_VAL(-1), +1 buffer
+        self.arg_pos_embed = nn.Embedding(N_ARGS, d_model)  # disambiguates which of the N_ARGS slots a value came from
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.pos_embed = nn.Embedding(max_len + 1, d_model)
 
@@ -27,7 +28,9 @@ class CADSequenceEncoder(nn.Module):
     def forward(self, command, args):
         batch_size, seq_len = command.shape
 
-        tokens = self.cmd_embed(command) + self.arg_embed(args + 1).sum(dim=2)
+        arg_positions = torch.arange(args.shape[-1], device=args.device)
+        arg_tokens = self.arg_embed(args + 1) + self.arg_pos_embed(arg_positions)
+        tokens = self.cmd_embed(command) + arg_tokens.sum(dim=2)
         cls = self.cls_token.expand(batch_size, -1, -1)
         tokens = torch.cat([cls, tokens], dim=1)
 
