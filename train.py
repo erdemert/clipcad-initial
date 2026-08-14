@@ -21,7 +21,7 @@ RUNS_DIR = Path("runs")
 LOG_EVERY_N_STEPS = 20
 PERSISTENT_WORKERS = True
 
-NUM_WORKERS = 4
+NUM_WORKERS = 32
 
 
 def _worker_init_fn(_worker_id):
