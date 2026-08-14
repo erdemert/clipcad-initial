@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from config import PathConfig
+from config import CheckpointConfig, PathConfig
 from dataset import CADImagePairDataset
 from losses import clip_contrastive_loss
 from metrics import evaluate_recall
@@ -18,7 +18,6 @@ NUM_EPOCHS = 100
 BATCH_SIZE = 512
 LR = 1e-4
 RUNS_DIR = Path("runs")
-CHECKPOINT_PATH = Path("checkpoints") / "latest.pt"
 LOG_EVERY_N_STEPS = 20
 PERSISTENT_WORKERS = True
 
@@ -33,6 +32,11 @@ def _worker_init_fn(_worker_id):
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
 logger = logging.getLogger("cad_clipper")
+
+
+def _save_checkpoint(path, epoch, model, val_loss):
+    torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "val_loss": val_loss}, path)
+    logger.info("saved checkpoint to %s", path)
 
 
 def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None, collect_embeddings=False):
@@ -119,7 +123,11 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
-    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_cfg = CheckpointConfig.default()
+    ckpt_cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = ckpt_cfg.checkpoint_dir / "latest.pt"
+    best_path = ckpt_cfg.checkpoint_dir / "best.pt"
+    best_val_loss = float("inf")
 
     for epoch in range(NUM_EPOCHS):
         train_loss = run_epoch(model, train_loader, device, epoch, "train", optimizer=optimizer, writer=writer)
@@ -138,8 +146,15 @@ def main():
         )
         writer.flush()
 
-        torch.save({"epoch": epoch, "model_state_dict": model.state_dict()}, CHECKPOINT_PATH)
-        logger.info("saved checkpoint to %s", CHECKPOINT_PATH)
+        _save_checkpoint(latest_path, epoch, model, val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            _save_checkpoint(best_path, epoch, model, val_loss)
+
+        if ckpt_cfg.save_every_n_epochs and (epoch + 1) % ckpt_cfg.every_n == 0:
+            periodic_path = ckpt_cfg.checkpoint_dir / f"epoch_{epoch:03d}.pt"
+            _save_checkpoint(periodic_path, epoch, model, val_loss)
 
     writer.close()
 
