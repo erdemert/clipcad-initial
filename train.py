@@ -14,7 +14,7 @@ from metrics import evaluate_recall
 from model import CADClipModel
 from splits import load_train_val_ids
 
-NUM_EPOCHS = 100
+NUM_EPOCHS = 150
 BATCH_SIZE = 512
 LR = 1e-4
 RUNS_DIR = Path("runs")
