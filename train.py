@@ -21,9 +21,7 @@ RUNS_DIR = Path("runs")
 LOG_EVERY_N_STEPS = 20
 PERSISTENT_WORKERS = True
 
-# Data loading for images at this scale plateaus well before using every core;
-# cap workers rather than spawning one per core.
-NUM_WORKERS = min(32, os.cpu_count() or 8)
+NUM_WORKERS = 4
 
 
 def _worker_init_fn(_worker_id):
