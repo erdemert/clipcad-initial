@@ -3,3 +3,4 @@ numpy
 Pillow
 torch
 open_clip_torch
+scikit-image

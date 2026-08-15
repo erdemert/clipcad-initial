@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from config import CheckpointConfig, PathConfig
 from dataset import CADImagePairDataset
 from losses import clip_contrastive_loss
-from metrics import evaluate_recall
+from metrics import evaluate_recall, evaluate_visual_recall
 from model import CADClipModel
 from splits import load_train_val_ids
 
@@ -19,6 +19,7 @@ BATCH_SIZE = 512
 LR = 1e-4
 RUNS_DIR = Path("runs")
 LOG_EVERY_N_STEPS = 20
+VISUAL_SIMILARITY_THRESHOLD = 0.9
 PERSISTENT_WORKERS = True
 
 NUM_WORKERS = 32
@@ -137,10 +138,18 @@ def main():
         for k, recall in recalls.items():
             writer.add_scalar(f"recall/val_top{k}", recall, epoch)
 
+        visual_recalls = evaluate_visual_recall(
+            val_image_embeds, val_cad_embeds, val_ids, cfg, threshold=VISUAL_SIMILARITY_THRESHOLD,
+        )
+        for k, visual_recall in visual_recalls.items():
+            writer.add_scalar(f"recall/val_top{k}_visual", visual_recall, epoch)
+
         writer.add_scalar("logit_scale", model.logit_scale.exp().item(), epoch)
         logger.info(
-            "epoch %03d  train_loss %.4f  val_loss %.4f  val_recall %s",
-            epoch, train_loss, val_loss, {k: round(v, 4) for k, v in recalls.items()},
+            "epoch %03d  train_loss %.4f  val_loss %.4f  val_recall %s  val_recall_visual %s",
+            epoch, train_loss, val_loss,
+            {k: round(v, 4) for k, v in recalls.items()},
+            {k: round(v, 4) for k, v in visual_recalls.items()},
         )
         writer.flush()
 
