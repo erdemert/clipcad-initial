@@ -39,7 +39,7 @@ class CheckpointConfig:
     def default(cls) -> "CheckpointConfig":
         checkpoint_dir = Path(os.environ.get("CAD_CLIPPER_CHECKPOINT_DIR", "checkpoints"))
         save_every_n_epochs = os.environ.get(
-            "CAD_CLIPPER_SAVE_EVERY_N_EPOCHS", "false"
+            "CAD_CLIPPER_SAVE_EVERY_N_EPOCHS", "true"
         ).lower() in ("1", "true", "yes")
         every_n = int(os.environ.get("CAD_CLIPPER_CHECKPOINT_EVERY_N", "5"))
         return cls(checkpoint_dir=checkpoint_dir, save_every_n_epochs=save_every_n_epochs, every_n=every_n)
