@@ -16,11 +16,11 @@ class PathConfig:
     def default(cls) -> "PathConfig":
         cad_vec_root = Path(os.environ.get(
             "CAD_CLIPPER_CAD_VEC_ROOT",
-            "/shared_homes/erdem_erturk_0/data/cad_vec",
+            "/mnt/amax5_drive/erdem_erturk_0/cad_data/data/cad_vec",
         ))
         images_root = Path(os.environ.get(
             "CAD_CLIPPER_IMAGES_ROOT",
-            "/shared_homes/erdem_erturk_0/images",
+            "/mnt/amax5_drive/erdem_erturk_0/cad_data/images",
         ))
         split_path = Path(os.environ.get(
             "CAD_CLIPPER_SPLIT_PATH",
