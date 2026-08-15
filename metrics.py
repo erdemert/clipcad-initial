@@ -3,7 +3,7 @@ import torch
 from skimage.metrics import structural_similarity as ssim
 
 from config import PathConfig
-from data_io import load_image
+from data_io import list_views, load_image
 
 
 def _load_gray(sample_id: str, view: int, cfg: PathConfig) -> np.ndarray:
@@ -11,9 +11,13 @@ def _load_gray(sample_id: str, view: int, cfg: PathConfig) -> np.ndarray:
 
 
 def visual_similarity(id_a: str, id_b: str, cfg: PathConfig) -> float:
-    """SSIM between the 0-indexed rendered view of two CAD models."""
-    img_a = _load_gray(id_a, 0, cfg)
-    img_b = _load_gray(id_b, 0, cfg)
+    """SSIM between the first available rendered view of two CAD models.
+
+    Not every id has a view index 0 (rendering gaps upstream), so this uses
+    each id's lowest available view index rather than a hardcoded one.
+    """
+    img_a = _load_gray(id_a, list_views(id_a, cfg)[0], cfg)
+    img_b = _load_gray(id_b, list_views(id_b, cfg)[0], cfg)
     return ssim(img_a, img_b, data_range=255)
 
 
@@ -21,8 +25,8 @@ def evaluate_visual_recall(image_embeds, cad_embeds, ids, cfg: PathConfig, ks=(1
     """Recall@K, relaxed with visual similarity.
 
     A retrieval within the top K counts as correct either when it's the exact
-    true id (as in evaluate_recall) or, when it isn't, its 0-indexed rendered
-    view is visually close enough (SSIM >= threshold) to the true id's — so a
+    true id (as in evaluate_recall) or, when it isn't, its rendered view is
+    visually close enough (SSIM >= threshold) to the true id's — so a
     visually-identical but differently-labeled CAD model isn't scored as a miss.
     """
     similarities = image_embeds @ cad_embeds.t()
