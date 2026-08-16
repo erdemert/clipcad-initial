@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.multiprocessing
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -13,6 +14,10 @@ from dataset import CADImagePairDataset
 from metrics import evaluate_recall
 from model import CADClipModel
 from splits import load_test_ids, load_train_val_ids
+
+# avoids passing worker batches through /dev/shm, which is too small/full on some
+# shared machines ("unable to allocate shared memory... No space left on device")
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 BATCH_SIZE = 512
 NUM_WORKERS = 8
