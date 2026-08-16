@@ -4,7 +4,6 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-import torch.multiprocessing
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -15,12 +14,11 @@ from metrics import evaluate_recall
 from model import CADClipModel
 from splits import load_test_ids, load_train_val_ids
 
-# avoids passing worker batches through /dev/shm, which is too small/full on some
-# shared machines ("unable to allocate shared memory... No space left on device")
-torch.multiprocessing.set_sharing_strategy("file_system")
-
 BATCH_SIZE = 512
-NUM_WORKERS = 8
+# 0 (no worker subprocesses): sidesteps /dev/shm entirely, which some shared
+# machines cap too small for multi-worker DataLoader tensor IPC. Evaluation is
+# bottlenecked by the model's forward pass anyway, not data loading.
+NUM_WORKERS = 0
 EVAL_RUNS_DIR = Path("runs_eval")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
