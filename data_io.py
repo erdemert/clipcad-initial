@@ -1,5 +1,4 @@
 import io
-import json
 
 import h5py
 import numpy as np
@@ -7,21 +6,29 @@ from PIL import Image
 
 from config import PathConfig
 
-_INDEX_SUFFIX = "_index.json"
-
 # Per-process cache of open shard image stores: {(images_root, shard): (h5py.File, id_to_row)}.
 # Populated lazily from __getitem__/list_views/load_image, never before a DataLoader worker
 # fork, so each forked worker builds its own independent cache rather than sharing file handles.
 _shard_cache = {}
 
 
-def _load_shard_index(shard: str, cfg: PathConfig) -> list[dict]:
-    """Return the manifest entries for one shard's rendered-image store, or [] if none exist."""
-    index_path = cfg.images_root / f"{shard}{_INDEX_SUFFIX}"
-    if not index_path.is_file():
-        return []
-    with open(index_path, "r") as f:
-        return json.load(f)
+def _decode_id(raw_id) -> str:
+    return raw_id.decode() if isinstance(raw_id, bytes) else raw_id
+
+
+def _rendered_ids(shard: str, cfg: PathConfig) -> set[str]:
+    """Return the ids actually present in one shard's image h5, or {} if the shard has no renders.
+
+    Reads and closes its own handle rather than going through _get_shard_store's cache, since
+    this runs once in the main process (via list_paired_ids) before DataLoader workers fork —
+    leaving an open h5py.File in that cache here would get inherited, unsafely shared, by every
+    forked worker.
+    """
+    h5_path = cfg.images_root / f"{shard}.h5"
+    if not h5_path.is_file():
+        return set()
+    with h5py.File(h5_path, "r") as f:
+        return {_decode_id(raw_id) for raw_id in f["ids"][:]}
 
 
 def _get_shard_store(shard: str, cfg: PathConfig):
@@ -34,10 +41,7 @@ def _get_shard_store(shard: str, cfg: PathConfig):
         return store
 
     h5_file = h5py.File(cfg.images_root / f"{shard}.h5", "r")
-    id_to_row = {
-        (raw_id.decode() if isinstance(raw_id, bytes) else raw_id): row
-        for row, raw_id in enumerate(h5_file["ids"][:])
-    }
+    id_to_row = {_decode_id(raw_id): row for row, raw_id in enumerate(h5_file["ids"][:])}
     store = (h5_file, id_to_row)
     _shard_cache[key] = store
     return store
@@ -55,17 +59,19 @@ def list_ids(cfg: PathConfig) -> list[str]:
 
 
 def list_paired_ids(cfg: PathConfig) -> list[str]:
-    """Return ids that have both a cad_vec file and a rendered-image entry in the shard index.
+    """Return ids that have both a cad_vec file and a rendered-image row in the shard's h5.
 
-    Some cad_vec samples have no matching renders (rendering-pipeline gaps upstream),
-    so this filters those out rather than let dataset loading crash on a missing view.
+    Some cad_vec samples have no matching renders (rendering-pipeline gaps upstream), so this
+    filters those out rather than let dataset loading crash on a missing view. Checked against
+    the image h5's own 'ids' dataset rather than the shard's _index.json manifest, since the
+    two can drift out of sync (seen in practice: ids listed in the JSON but absent from the h5).
     """
     ids = []
     for shard_dir in sorted(cfg.cad_vec_root.iterdir()):
         if not shard_dir.is_dir():
             continue
         shard = shard_dir.name
-        rendered_ids = {entry["id"] for entry in _load_shard_index(shard, cfg)}
+        rendered_ids = _rendered_ids(shard, cfg)
         for h5_file in sorted(shard_dir.glob("*.h5")):
             sample_id = f"{shard}/{h5_file.stem}"
             if sample_id in rendered_ids:
