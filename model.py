@@ -84,6 +84,19 @@ class CADClipModel(nn.Module):
     def encode_image(self, image):
         return F.normalize(self.image_proj(self.visual(image)), dim=-1)
 
+    def encode_image_multiview(self, image):
+        """Like encode_image, but pools an extra per-sample views dimension when present.
+
+        Accepts (B, C, H, W) — identical to encode_image — or (B, K, C, H, W), where K
+        independently-encoded views are mean-pooled into one embedding per sample.
+        """
+        if image.dim() == 4:
+            return self.encode_image(image)
+        batch_size, n_views = image.shape[:2]
+        flat = image.reshape(batch_size * n_views, *image.shape[2:])
+        per_view = self.encode_image(flat).view(batch_size, n_views, -1)
+        return F.normalize(per_view.mean(dim=1), dim=-1)
+
     def encode_cad(self, command, args):
         return F.normalize(self.cad_proj(self.cad_encoder(command, args)), dim=-1)
 

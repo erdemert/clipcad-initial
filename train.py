@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 from datetime import datetime
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from config import CheckpointConfig, PathConfig
+from config import RANDOM_SEED, CheckpointConfig, PathConfig, ViewConfig
 from dataset import CADImagePairDataset
 from losses import clip_contrastive_loss
 from metrics import evaluate_recall
@@ -26,6 +27,14 @@ NUM_WORKERS = 32
 
 def _worker_init_fn(_worker_id):
     torch.set_num_threads(1)
+    # torch derives a unique-per-worker seed from the base seed set via torch.manual_seed(),
+    # so this is deterministic across runs but distinct across workers, avoiding every
+    # worker replaying the same "random" view choices after being forked from the parent.
+    worker_seed = torch.utils.data.get_worker_info().seed % (2**32)
+    random.seed(worker_seed)
+    dataset = torch.utils.data.get_worker_info().dataset
+    if hasattr(dataset, "rng"):
+        dataset.rng = random.Random(worker_seed)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
@@ -50,7 +59,7 @@ def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None, 
         args = batch["args"].to(device, non_blocking=True)
 
         with torch.set_grad_enabled(is_train), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            image_emb = model.encode_image(image)
+            image_emb = model.encode_image_multiview(image)
             cad_emb = model.encode_cad(command, args)
             logit_scale = model.logit_scale.exp()
             logits_per_image = logit_scale * image_emb @ cad_emb.t()
@@ -87,6 +96,11 @@ def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None, 
 
 
 def main():
+    random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(RANDOM_SEED)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":
         # leave the rest of the cores for the NUM_WORKERS dataloader processes
@@ -97,19 +111,27 @@ def main():
     logger.info("logging to %s (tensorboard: tensorboard --logdir %s)", run_dir, run_dir.parent)
 
     cfg = PathConfig.default()
+    view_cfg = ViewConfig.default()
     model = CADClipModel(image_model_name="RN50", image_pretrained="openai").to(device)
 
     train_ids, val_ids = load_train_val_ids(cfg)
-    logger.info("train ids: %d  val ids: %d", len(train_ids), len(val_ids))
-    train_set = CADImagePairDataset(cfg, ids=train_ids, image_transform=model.preprocess)
+    logger.info(
+        "train ids: %d  val ids: %d  views_per_sample_train: %d",
+        len(train_ids), len(val_ids), view_cfg.views_per_sample_train,
+    )
+    train_set = CADImagePairDataset(
+        cfg, ids=train_ids, image_transform=model.preprocess,
+        views_per_sample=view_cfg.views_per_sample_train, seed=RANDOM_SEED,
+    )
     # deterministic=True: always the same rendered view per id, so val loss/recall are
     # comparable across epochs instead of jittering with a randomly chosen view.
     val_set = CADImagePairDataset(cfg, ids=val_ids, image_transform=model.preprocess, deterministic=True)
 
     pin_memory = device.type == "cuda"
     persistent_workers = PERSISTENT_WORKERS and NUM_WORKERS > 0
+    train_generator = torch.Generator().manual_seed(RANDOM_SEED)
     train_loader = DataLoader(
-        train_set, batch_size=BATCH_SIZE, shuffle=True,
+        train_set, batch_size=BATCH_SIZE, shuffle=True, generator=train_generator,
         num_workers=NUM_WORKERS, pin_memory=pin_memory, worker_init_fn=_worker_init_fn,
         persistent_workers=persistent_workers,
     )

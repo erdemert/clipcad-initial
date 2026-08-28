@@ -1,5 +1,6 @@
 import argparse
 import logging
+import random
 from datetime import datetime
 from pathlib import Path
 
@@ -8,7 +9,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from cad_vec_similarity import DEFAULT_CONFIG, cad_similarity, load_cad_vector
-from config import CheckpointConfig, PathConfig
+from config import RANDOM_SEED, CheckpointConfig, PathConfig, ViewConfig
+from data_io import list_views
 from dataset import CADImagePairDataset
 from metrics import evaluate_recall
 from model import CADClipModel
@@ -48,6 +50,40 @@ def embed_split(model, cfg, ids, device):
             ordered_ids.extend(batch["id"])
 
     return torch.cat(image_embeds), torch.cat(cad_embeds), ordered_ids
+
+
+def sample_views_per_id(ids, cfg, n_views, seed):
+    """Return an expanded (id, view) list: n_views independently sampled views per id."""
+    rng = random.Random(seed)
+    expanded = []
+    for sample_id in ids:
+        views = list_views(sample_id, cfg)
+        k = min(n_views, len(views))
+        expanded.extend((sample_id, view) for view in rng.sample(views, k))
+    return expanded
+
+
+def evaluate_multiview_recall(model, cfg, ids, cad_embeds, device, n_views, seed, ks=(1, 5, 10)):
+    """Recall@K sampling n_views independent renders per model; each view is its own query row.
+
+    ids/cad_embeds must already be aligned (cad_embeds[i] is the gallery entry for ids[i]) —
+    the sampled views are additional, independent image queries against that same gallery.
+    """
+    expanded_ids = sample_views_per_id(ids, cfg, n_views, seed)
+    dataset = CADImagePairDataset(cfg, ids=expanded_ids, image_transform=model.preprocess)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+
+    image_embeds, row_ids = [], []
+    with torch.no_grad():
+        for batch in loader:
+            image = batch["image"].to(device, non_blocking=True)
+            image_embeds.append(model.encode_image(image).float().cpu())
+            row_ids.extend(batch["id"])
+    image_embeds = torch.cat(image_embeds)
+
+    gallery_index = {sample_id: i for i, sample_id in enumerate(ids)}
+    gt_indices = torch.tensor([gallery_index[sample_id] for sample_id in row_ids], dtype=torch.long)
+    return evaluate_recall(image_embeds, cad_embeds, gt_indices=gt_indices, ks=ks)
 
 
 def cad_vector_cache(cfg):
@@ -104,6 +140,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = PathConfig.default()
+    view_cfg = ViewConfig.default()
 
     if args.checkpoint is not None:
         checkpoints = [(None, args.checkpoint)]
@@ -145,17 +182,27 @@ def main():
                 image_embeds, cad_embeds, ordered_ids, vec_caches[name],
                 ks=tuple(args.ks), threshold=args.threshold,
             )
+            # same fixed seed on every checkpoint: all checkpoints in a sweep are scored
+            # against the identical sampled views, so results stay comparable across epochs.
+            multiview_recalls, _ = evaluate_multiview_recall(
+                model, cfg, ordered_ids, cad_embeds, device,
+                n_views=view_cfg.views_per_query_inference, seed=RANDOM_SEED, ks=tuple(args.ks),
+            )
 
             for k, v in exact_recalls.items():
                 writer.add_scalar(f"{name}/recall_top{k}", v, step)
             for k, v in loose_recalls.items():
                 writer.add_scalar(f"{name}/loose_recall_top{k}", v, step)
+            for k, v in multiview_recalls.items():
+                writer.add_scalar(f"{name}/multiview_recall_top{k}", v, step)
 
             logger.info(
-                "[%s] epoch %s  n=%d  exact_recall=%s  loose_recall=%s",
+                "[%s] epoch %s  n=%d  exact_recall=%s  loose_recall=%s  multiview_recall(n=%d)=%s",
                 name, step, len(ordered_ids),
                 {k: round(v, 4) for k, v in exact_recalls.items()},
                 {k: round(v, 4) for k, v in loose_recalls.items()},
+                view_cfg.views_per_query_inference,
+                {k: round(v, 4) for k, v in multiview_recalls.items()},
             )
         writer.flush()
 
