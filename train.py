@@ -16,7 +16,10 @@ from model import CADClipModel
 from splits import load_train_val_ids
 
 NUM_EPOCHS = 150
-BATCH_SIZE = 512
+# 128 x views_per_sample_train(4) = 512 images through the image tower per step, matching the
+# per-step image count that fit in GPU memory before multi-view pooling was added — this avoids
+# a straight BATCH_SIZE=512 x 4 views = 2048-image forward pass OOM-ing.
+BATCH_SIZE = 128
 LR = 1e-4
 RUNS_DIR = Path("runs")
 LOG_EVERY_N_STEPS = 20

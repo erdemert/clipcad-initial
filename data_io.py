@@ -1,10 +1,14 @@
 import io
+import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import h5py
 import numpy as np
 from PIL import Image
 
 from config import PathConfig
+
+logger = logging.getLogger(__name__)
 
 # Per-process cache of open shard image stores: {(images_root, shard): (h5py.File, id_to_row)}.
 # Populated lazily from __getitem__/list_views/load_image, never before a DataLoader worker
@@ -65,13 +69,26 @@ def list_paired_ids(cfg: PathConfig) -> list[str]:
     filters those out rather than let dataset loading crash on a missing view. Checked against
     the image h5's own 'ids' dataset rather than the shard's _index.json manifest, since the
     two can drift out of sync (seen in practice: ids listed in the JSON but absent from the h5).
+
+    Opening one h5 file per shard is the expensive part on a network-mounted filesystem, so
+    the per-shard opens run concurrently (I/O-bound: they spend their time waiting on the
+    network, not holding the GIL) rather than one after another.
     """
+    shard_dirs = [d for d in sorted(cfg.cad_vec_root.iterdir()) if d.is_dir()]
+    with ThreadPoolExecutor(max_workers=min(32, len(shard_dirs)) or 1) as pool:
+        rendered_id_sets = list(pool.map(lambda d: _rendered_ids(d.name, cfg), shard_dirs))
+
+    missing_shards = sum(1 for rendered_ids in rendered_id_sets if not rendered_ids)
+    if missing_shards:
+        logger.warning(
+            "%d of %d cad_vec shards have no rendered-image h5 at all under %s "
+            "(rendering may still be in progress) — their ids are excluded entirely",
+            missing_shards, len(shard_dirs), cfg.images_root,
+        )
+
     ids = []
-    for shard_dir in sorted(cfg.cad_vec_root.iterdir()):
-        if not shard_dir.is_dir():
-            continue
+    for shard_dir, rendered_ids in zip(shard_dirs, rendered_id_sets):
         shard = shard_dir.name
-        rendered_ids = _rendered_ids(shard, cfg)
         for h5_file in sorted(shard_dir.glob("*.h5")):
             sample_id = f"{shard}/{h5_file.stem}"
             if sample_id in rendered_ids:
