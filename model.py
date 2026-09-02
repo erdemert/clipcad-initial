@@ -52,6 +52,27 @@ class CADSequenceEncoder(nn.Module):
         return torch.cat([cls_mask, seq_mask], dim=1)
 
 
+class ViewAttentionPool(nn.Module):
+    """Learned attention pooling over a per-sample set of view embeddings.
+
+    A single learned query vector scores each view embedding (dot product); softmax
+    over those scores gives per-view weights, and the pooled embedding is their
+    weighted sum. Mean-pooling is the special case of uniform weights, so this is a
+    strict generalization that lets the model learn to favor more informative angles.
+    """
+
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(embed_dim) * 0.02)
+        self.scale = embed_dim**-0.5
+
+    def forward(self, per_view):
+        # per_view: (B, K, D) -> pooled: (B, D)
+        scores = (per_view @ self.query) * self.scale
+        weights = F.softmax(scores, dim=-1)
+        return (weights.unsqueeze(-1) * per_view).sum(dim=1)
+
+
 class CADClipModel(nn.Module):
     """CLIP-style dual encoder: pretrained open_clip image tower + from-scratch CAD transformer."""
 
@@ -78,6 +99,7 @@ class CADClipModel(nn.Module):
 
         self.image_proj = nn.Identity() if image_dim == embed_dim else nn.Linear(image_dim, embed_dim)
         self.cad_proj = nn.Identity() if cad_d_model == embed_dim else nn.Linear(cad_d_model, embed_dim)
+        self.view_pool = ViewAttentionPool(embed_dim)
 
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
 
@@ -88,14 +110,15 @@ class CADClipModel(nn.Module):
         """Like encode_image, but pools an extra per-sample views dimension when present.
 
         Accepts (B, C, H, W) — identical to encode_image — or (B, K, C, H, W), where K
-        independently-encoded views are mean-pooled into one embedding per sample.
+        independently-encoded views are combined into one embedding per sample via
+        learned attention pooling (see ViewAttentionPool).
         """
         if image.dim() == 4:
             return self.encode_image(image)
         batch_size, n_views = image.shape[:2]
         flat = image.reshape(batch_size * n_views, *image.shape[2:])
         per_view = self.encode_image(flat).view(batch_size, n_views, -1)
-        return F.normalize(per_view.mean(dim=1), dim=-1)
+        return F.normalize(self.view_pool(per_view), dim=-1)
 
     def encode_cad(self, command, args):
         return F.normalize(self.cad_proj(self.cad_encoder(command, args)), dim=-1)
