@@ -4,6 +4,7 @@ import open_clip
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from cad_format import ALL_COMMANDS, ARGS_DIM, DEFAULT_MAX_LEN, EOS_IDX, N_ARGS
 
@@ -52,27 +53,6 @@ class CADSequenceEncoder(nn.Module):
         return torch.cat([cls_mask, seq_mask], dim=1)
 
 
-class ViewAttentionPool(nn.Module):
-    """Learned attention pooling over a per-sample set of view embeddings.
-
-    A single learned query vector scores each view embedding (dot product); softmax
-    over those scores gives per-view weights, and the pooled embedding is their
-    weighted sum. Mean-pooling is the special case of uniform weights, so this is a
-    strict generalization that lets the model learn to favor more informative angles.
-    """
-
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.query = nn.Parameter(torch.randn(embed_dim) * 0.02)
-        self.scale = embed_dim**-0.5
-
-    def forward(self, per_view):
-        # per_view: (B, K, D) -> pooled: (B, D)
-        scores = (per_view @ self.query) * self.scale
-        weights = F.softmax(scores, dim=-1)
-        return (weights.unsqueeze(-1) * per_view).sum(dim=1)
-
-
 class CADClipModel(nn.Module):
     """CLIP-style dual encoder: pretrained open_clip image tower + from-scratch CAD transformer."""
 
@@ -99,26 +79,32 @@ class CADClipModel(nn.Module):
 
         self.image_proj = nn.Identity() if image_dim == embed_dim else nn.Linear(image_dim, embed_dim)
         self.cad_proj = nn.Identity() if cad_d_model == embed_dim else nn.Linear(cad_d_model, embed_dim)
-        self.view_pool = ViewAttentionPool(embed_dim)
 
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
 
     def encode_image(self, image):
-        return F.normalize(self.image_proj(self.visual(image)), dim=-1)
+        return F.normalize(self.image_proj(self._visual_forward(image)), dim=-1)
 
-    def encode_image_multiview(self, image):
-        """Like encode_image, but pools an extra per-sample views dimension when present.
+    def _visual_forward(self, image):
+        """Run the image tower, checkpointing its residual stages while training.
 
-        Accepts (B, C, H, W) — identical to encode_image — or (B, K, C, H, W), where K
-        independently-encoded views are combined into one embedding per sample via
-        learned attention pooling (see ViewAttentionPool).
+        open_clip's ModifiedResNet.set_grad_checkpointing() is a no-op stub — checkpointing
+        isn't implemented for its CNN backbone — so this reimplements its forward pass
+        (stem -> 4 residual stages -> attention pool) with each stage wrapped in
+        torch.utils.checkpoint. That trades recompute for the activation memory that would
+        otherwise have to be held for every one of the (up to 42) views per training sample.
+        Falls back to a plain forward outside training, or for any other visual tower shape
+        (e.g. a ViT backbone, which has no stem/layerN attributes to checkpoint this way).
         """
-        if image.dim() == 4:
-            return self.encode_image(image)
-        batch_size, n_views = image.shape[:2]
-        flat = image.reshape(batch_size * n_views, *image.shape[2:])
-        per_view = self.encode_image(flat).view(batch_size, n_views, -1)
-        return F.normalize(self.view_pool(per_view), dim=-1)
+        visual = self.visual
+        if not self.training or not (hasattr(visual, "stem") and hasattr(visual, "layer1")):
+            return visual(image)
+        x = checkpoint(visual.stem, image, use_reentrant=False)
+        x = checkpoint(visual.layer1, x, use_reentrant=False)
+        x = checkpoint(visual.layer2, x, use_reentrant=False)
+        x = checkpoint(visual.layer3, x, use_reentrant=False)
+        x = checkpoint(visual.layer4, x, use_reentrant=False)
+        return visual.attnpool(x)
 
     def encode_cad(self, command, args):
         return F.normalize(self.cad_proj(self.cad_encoder(command, args)), dim=-1)

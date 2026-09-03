@@ -40,8 +40,9 @@ class ViewConfig:
 
     @classmethod
     def default(cls) -> "ViewConfig":
-        views_per_sample_train = int(os.environ.get("CAD_CLIPPER_VIEWS_PER_SAMPLE_TRAIN", "4"))
-        views_per_query_inference = int(os.environ.get("CAD_CLIPPER_VIEWS_PER_QUERY_INFERENCE", "4"))
+        # All 42 rendered angles per sample, in both training and the eval multi-view sweep.
+        views_per_sample_train = int(os.environ.get("CAD_CLIPPER_VIEWS_PER_SAMPLE_TRAIN", "42"))
+        views_per_query_inference = int(os.environ.get("CAD_CLIPPER_VIEWS_PER_QUERY_INFERENCE", "42"))
         return cls(
             views_per_sample_train=views_per_sample_train,
             views_per_query_inference=views_per_query_inference,

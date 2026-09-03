@@ -17,7 +17,8 @@ class CADImagePairDataset(Dataset):
 
     With views_per_sample > 1, "image" is a stack of that many views instead of a
     single image (shape (views_per_sample, C, H, W) rather than (C, H, W)) — for
-    callers that pool several views into one embedding (see CADClipModel.encode_image_multiview).
+    callers that encode and score each view independently against one CAD embedding
+    (see losses.multiview_contrastive_loss).
 
     An entry in `ids` may also be an explicit (sample_id, view) pair instead of a bare
     id, to force one specific view rather than sampling — used when each sampled view

@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from config import RANDOM_SEED, CheckpointConfig, PathConfig, ViewConfig
 from dataset import CADImagePairDataset
-from losses import clip_contrastive_loss
+from losses import clip_contrastive_loss, multiview_contrastive_loss
 from metrics import evaluate_recall
 from model import CADClipModel
 from splits import load_train_val_ids
@@ -62,12 +62,21 @@ def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None, 
         args = batch["args"].to(device, non_blocking=True)
 
         with torch.set_grad_enabled(is_train), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            image_emb = model.encode_image_multiview(image)
             cad_emb = model.encode_cad(command, args)
             logit_scale = model.logit_scale.exp()
-            logits_per_image = logit_scale * image_emb @ cad_emb.t()
-            logits_per_cad = logits_per_image.t()
-            loss = clip_contrastive_loss(logits_per_image, logits_per_cad)
+            if image.dim() == 5:
+                # (B, K, C, H, W): K views per sample, each encoded and scored independently
+                # against the shared CAD embedding — no pooling, matching the single-image
+                # query used at retrieval time (see retrieve.py).
+                batch_size, n_views = image.shape[:2]
+                flat = image.reshape(batch_size * n_views, *image.shape[2:])
+                image_emb = model.encode_image(flat)
+                loss = multiview_contrastive_loss(cad_emb, image_emb, n_views, logit_scale)
+            else:
+                image_emb = model.encode_image(image)
+                logits_per_image = logit_scale * image_emb @ cad_emb.t()
+                logits_per_cad = logits_per_image.t()
+                loss = clip_contrastive_loss(logits_per_image, logits_per_cad)
 
         if is_train:
             optimizer.zero_grad()
