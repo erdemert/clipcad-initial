@@ -1,7 +1,9 @@
 import io
+import itertools
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 
 import h5py
 import numpy as np
@@ -11,10 +13,16 @@ from config import PathConfig
 
 logger = logging.getLogger(__name__)
 
-# Per-process cache of open shard image stores: {(images_root, shard): (h5py.File, id_to_row)}.
-# Populated lazily from __getitem__/list_views/load_image, never before a DataLoader worker
-# fork, so each forked worker builds its own independent cache rather than sharing file handles.
-_shard_cache = {}
+# Per-process, size-capped LRU cache of open shard image stores:
+# {(images_root, shard): (h5py.File, id_to_row)}. Populated lazily from
+# __getitem__/list_views/load_image, never before a DataLoader worker fork, so each forked
+# worker builds its own independent cache rather than sharing file handles. Capped (rather
+# than left to grow for the worker's whole persistent_workers=True lifetime) because with
+# shuffled sampling a worker can touch most/all shards within the first few dozen steps —
+# an uncapped cache means every one of those shards' open h5py.File handles + id_to_row
+# dicts stays alive, per worker, for the entire run.
+_SHARD_CACHE_MAX_SIZE = 32
+_shard_cache = OrderedDict()
 
 
 def _decode_id(raw_id) -> str:
@@ -43,12 +51,16 @@ def _get_shard_store(shard: str, cfg: PathConfig):
     key = (str(cfg.images_root), shard)
     store = _shard_cache.get(key)
     if store is not None:
+        _shard_cache.move_to_end(key)
         return store
 
     h5_file = h5py.File(cfg.images_root / f"{shard}.h5", "r")
     id_to_row = {_decode_id(raw_id): row for row, raw_id in enumerate(h5_file["ids"][:])}
     store = (h5_file, id_to_row)
     _shard_cache[key] = store
+    if len(_shard_cache) > _SHARD_CACHE_MAX_SIZE:
+        _, (evicted_file, _) = _shard_cache.popitem(last=False)
+        evicted_file.close()
     return store
 
 
@@ -87,16 +99,19 @@ def list_paired_ids(cfg: PathConfig) -> list[str]:
 
     cad_vec_root stores one .h5 file per sample (not per shard), so each shard's directory
     listing (`glob("*.h5")`) can itself be the expensive part on a network-mounted filesystem —
-    not just opening the shard's image h5. Both run inside the same per-shard worker so they're
-    concurrent across shards together (I/O-bound: waiting on the network, not holding the GIL);
-    an earlier version parallelized only the image-h5 opens and left the cad_vec directory
-    listing sequential afterward, which was the actual bottleneck.
+    not just opening the shard's image h5.
+
+    Uses a process pool, not a thread pool: h5py serializes essentially every call into the
+    HDF5 C library through one process-wide lock (its "Phil" lock, since the underlying HDF5
+    library isn't thread-safe), so threads calling h5py.File(...) concurrently still run those
+    opens one at a time — measured in production at ~30s/shard whether "concurrent" or not.
+    Separate processes each get their own independent lock, so this actually parallelizes.
     """
     t0 = time.monotonic()
     shard_dirs = [d for d in sorted(cfg.cad_vec_root.iterdir()) if d.is_dir()]
     t1 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=min(32, len(shard_dirs)) or 1) as pool:
-        results = list(pool.map(lambda d: _shard_paired_ids(d, cfg), shard_dirs))
+    with ProcessPoolExecutor(max_workers=min(32, len(shard_dirs)) or 1) as pool:
+        results = list(pool.map(_shard_paired_ids, shard_dirs, itertools.repeat(cfg)))
     t2 = time.monotonic()
     logger.info(
         "list_paired_ids: %d shard dirs listed in %.1fs, %d shards scanned concurrently in %.1fs",

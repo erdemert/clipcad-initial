@@ -8,6 +8,11 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from config import RANDOM_SEED, CheckpointConfig, PathConfig, ViewConfig
 from dataset import CADImagePairDataset
 from losses import clip_contrastive_loss, multiview_contrastive_loss
@@ -54,6 +59,28 @@ def _save_checkpoint(path, epoch, model, val_loss):
     logger.info("saved checkpoint to %s", path)
 
 
+def _host_rss_gb():
+    """Total host RSS (this process + every live child, e.g. DataLoader workers), in GB.
+
+    This is the number SLURM's cgroup OOM killer is actually watching — logged periodically
+    so a future OOM shows the growth curve leading up to it instead of just the final kill.
+    Returns None if psutil isn't installed rather than raising, since this is diagnostic only.
+    """
+    if psutil is None:
+        return None
+    try:
+        proc = psutil.Process()
+        rss = proc.memory_info().rss
+        for child in proc.children(recursive=True):
+            try:
+                rss += child.memory_info().rss
+            except psutil.NoSuchProcess:
+                pass
+        return rss / 1e9
+    except Exception:
+        return None
+
+
 def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None, collect_embeddings=False):
     is_train = optimizer is not None
     model.train(is_train)
@@ -98,9 +125,11 @@ def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None, 
         n_batches += 1
 
         if step % LOG_EVERY_N_STEPS == 0:
+            host_rss_gb = _host_rss_gb()
+            rss_str = f"  host_rss {host_rss_gb:.1f}GB" if host_rss_gb is not None else ""
             logger.info(
-                "epoch %03d  %s  step %d/%d  loss %.4f  running_avg %.4f",
-                epoch, phase, step, n_batches_total, loss.item(), total_loss / n_batches,
+                "epoch %03d  %s  step %d/%d  loss %.4f  running_avg %.4f%s",
+                epoch, phase, step, n_batches_total, loss.item(), total_loss / n_batches, rss_str,
             )
 
     avg_loss = total_loss / n_batches
