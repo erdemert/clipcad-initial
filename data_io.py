@@ -1,5 +1,6 @@
 import io
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import h5py
@@ -62,6 +63,20 @@ def list_ids(cfg: PathConfig) -> list[str]:
     return ids
 
 
+def _shard_paired_ids(shard_dir, cfg: PathConfig):
+    """Worker for list_paired_ids: one shard's (paired_ids, has_any_renders_at_all)."""
+    shard = shard_dir.name
+    rendered_ids = _rendered_ids(shard, cfg)
+    if not rendered_ids:
+        return [], False
+    paired = [
+        sample_id
+        for h5_file in sorted(shard_dir.glob("*.h5"))
+        if (sample_id := f"{shard}/{h5_file.stem}") in rendered_ids
+    ]
+    return paired, True
+
+
 def list_paired_ids(cfg: PathConfig) -> list[str]:
     """Return ids that have both a cad_vec file and a rendered-image row in the shard's h5.
 
@@ -70,15 +85,25 @@ def list_paired_ids(cfg: PathConfig) -> list[str]:
     the image h5's own 'ids' dataset rather than the shard's _index.json manifest, since the
     two can drift out of sync (seen in practice: ids listed in the JSON but absent from the h5).
 
-    Opening one h5 file per shard is the expensive part on a network-mounted filesystem, so
-    the per-shard opens run concurrently (I/O-bound: they spend their time waiting on the
-    network, not holding the GIL) rather than one after another.
+    cad_vec_root stores one .h5 file per sample (not per shard), so each shard's directory
+    listing (`glob("*.h5")`) can itself be the expensive part on a network-mounted filesystem —
+    not just opening the shard's image h5. Both run inside the same per-shard worker so they're
+    concurrent across shards together (I/O-bound: waiting on the network, not holding the GIL);
+    an earlier version parallelized only the image-h5 opens and left the cad_vec directory
+    listing sequential afterward, which was the actual bottleneck.
     """
+    t0 = time.monotonic()
     shard_dirs = [d for d in sorted(cfg.cad_vec_root.iterdir()) if d.is_dir()]
+    t1 = time.monotonic()
     with ThreadPoolExecutor(max_workers=min(32, len(shard_dirs)) or 1) as pool:
-        rendered_id_sets = list(pool.map(lambda d: _rendered_ids(d.name, cfg), shard_dirs))
+        results = list(pool.map(lambda d: _shard_paired_ids(d, cfg), shard_dirs))
+    t2 = time.monotonic()
+    logger.info(
+        "list_paired_ids: %d shard dirs listed in %.1fs, %d shards scanned concurrently in %.1fs",
+        len(shard_dirs), t1 - t0, len(shard_dirs), t2 - t1,
+    )
 
-    missing_shards = sum(1 for rendered_ids in rendered_id_sets if not rendered_ids)
+    missing_shards = sum(1 for _, has_renders in results if not has_renders)
     if missing_shards:
         logger.warning(
             "%d of %d cad_vec shards have no rendered-image h5 at all under %s "
@@ -87,12 +112,8 @@ def list_paired_ids(cfg: PathConfig) -> list[str]:
         )
 
     ids = []
-    for shard_dir, rendered_ids in zip(shard_dirs, rendered_id_sets):
-        shard = shard_dir.name
-        for h5_file in sorted(shard_dir.glob("*.h5")):
-            sample_id = f"{shard}/{h5_file.stem}"
-            if sample_id in rendered_ids:
-                ids.append(sample_id)
+    for paired, _ in results:
+        ids.extend(paired)
     return ids
 
 
