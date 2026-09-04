@@ -16,10 +16,14 @@ from model import CADClipModel
 from splits import load_train_val_ids
 
 NUM_EPOCHS = 150
-# 128 x views_per_sample_train(4) = 512 images through the image tower per step, matching the
-# per-step image count that fit in GPU memory before multi-view pooling was added — this avoids
-# a straight BATCH_SIZE=512 x 4 views = 2048-image forward pass OOM-ing.
+# Host-RAM sizing, not GPU: with views_per_sample_train=42, one collated image batch is
+# BATCH_SIZE x 42 x 3 x 224 x 224 x 4B ~= BATCH_SIZE x 25.3MB. The DataLoader can buffer up to
+# NUM_WORKERS x TRAIN_PREFETCH_FACTOR batches ahead of the training loop, so worst case this job
+# holds NUM_WORKERS x TRAIN_PREFETCH_FACTOR x BATCH_SIZE x 25.3MB of host RAM. At NUM_WORKERS=32
+# that's ~208GB for 128/2 (BATCH_SIZE/TRAIN_PREFETCH_FACTOR) — fits with headroom against
+# train.slurm's --mem-per-gpu=256G, but OOM-killed the original 128G budget outright.
 BATCH_SIZE = 128
+TRAIN_PREFETCH_FACTOR = 2
 LR = 1e-4
 RUNS_DIR = Path("runs")
 LOG_EVERY_N_STEPS = 20
@@ -145,7 +149,7 @@ def main():
     train_loader = DataLoader(
         train_set, batch_size=BATCH_SIZE, shuffle=True, generator=train_generator,
         num_workers=NUM_WORKERS, pin_memory=pin_memory, worker_init_fn=_worker_init_fn,
-        persistent_workers=persistent_workers,
+        persistent_workers=persistent_workers, prefetch_factor=TRAIN_PREFETCH_FACTOR,
     )
     val_loader = DataLoader(
         val_set, batch_size=BATCH_SIZE, shuffle=False,
