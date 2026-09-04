@@ -19,11 +19,12 @@ NUM_EPOCHS = 150
 # Host-RAM sizing, not GPU: with views_per_sample_train=42, one collated image batch is
 # BATCH_SIZE x 42 x 3 x 224 x 224 x 4B ~= BATCH_SIZE x 25.3MB. The DataLoader can buffer up to
 # NUM_WORKERS x TRAIN_PREFETCH_FACTOR batches ahead of the training loop, so worst case this job
-# holds NUM_WORKERS x TRAIN_PREFETCH_FACTOR x BATCH_SIZE x 25.3MB of host RAM. At NUM_WORKERS=32
-# that's ~208GB for 128/2 (BATCH_SIZE/TRAIN_PREFETCH_FACTOR) — fits with headroom against
-# train.slurm's --mem-per-gpu=256G, but OOM-killed the original 128G budget outright.
-BATCH_SIZE = 128
-TRAIN_PREFETCH_FACTOR = 2
+# holds NUM_WORKERS x TRAIN_PREFETCH_FACTOR x BATCH_SIZE x 25.3MB of host RAM. train.slurm's
+# --mem-per-gpu is capped at 128G (cluster limit, not adjustable) — at NUM_WORKERS=32, 128/2
+# (BATCH_SIZE/TRAIN_PREFETCH_FACTOR) needs ~208GB and reliably OOMs; 64/1 keeps worst case to
+# ~52GB, leaving real headroom under the 128G ceiling.
+BATCH_SIZE = 64
+TRAIN_PREFETCH_FACTOR = 1
 LR = 1e-4
 RUNS_DIR = Path("runs")
 LOG_EVERY_N_STEPS = 20
