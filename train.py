@@ -21,14 +21,22 @@ from model import CADClipModel
 from splits import load_train_val_ids
 
 NUM_EPOCHS = 150
-# Host-RAM sizing, not GPU: with views_per_sample_train=42, one collated image batch is
-# BATCH_SIZE x 42 x 3 x 224 x 224 x 4B ~= BATCH_SIZE x 25.3MB. The DataLoader can buffer up to
-# NUM_WORKERS x TRAIN_PREFETCH_FACTOR batches ahead of the training loop, so worst case this job
-# holds NUM_WORKERS x TRAIN_PREFETCH_FACTOR x BATCH_SIZE x 25.3MB of host RAM. train.slurm's
-# --mem-per-gpu is capped at 128G (cluster limit, not adjustable) — at NUM_WORKERS=32, 128/2
-# (BATCH_SIZE/TRAIN_PREFETCH_FACTOR) needs ~208GB and reliably OOMs; 64/1 keeps worst case to
-# ~52GB, leaving real headroom under the 128G ceiling.
-BATCH_SIZE = 64
+# Sized against BOTH GPU and host RAM, not just host RAM (see git history for the host-only
+# version that still OOM'd on GPU). With views_per_sample_train=42, N = BATCH_SIZE x 42 images
+# go through the image tower together each step.
+#   - GPU: gradient-checkpointing the visual tower (see model.py) still needs each of its 5
+#     checkpointed segments' boundary-input tensors held live for recomputation during
+#     backward (~N x (64x112x112 + 64x112x112 + 256x56x56 + 512x28x28 + 1024x14x14) x 4B),
+#     plus backward-pass gradients of similar magnitude — confirmed in production: at
+#     BATCH_SIZE=64 (N=2688) this hit ~78GB used out of 85GB, and a CUDA OOM warning's byte
+#     count matched N x 64 x 112 x 112 x 4B (the stem output tensor) exactly. Since this scales
+#     ~linearly with N, BATCH_SIZE=32 (N=1344) roughly halves it to a much safer ~39GB.
+#   - Host RAM: one collated image batch is BATCH_SIZE x 42 x 3 x 224 x 224 x 4B ~=
+#     BATCH_SIZE x 25.3MB, and the DataLoader can buffer up to
+#     NUM_WORKERS x TRAIN_PREFETCH_FACTOR batches ahead of the training loop — worst case
+#     ~26GB at 32/32/1 (BATCH_SIZE/NUM_WORKERS/TRAIN_PREFETCH_FACTOR), comfortably under
+#     train.slurm's --mem-per-gpu=128G (a cluster-imposed ceiling, not adjustable further).
+BATCH_SIZE = 32
 TRAIN_PREFETCH_FACTOR = 1
 LR = 1e-4
 RUNS_DIR = Path("runs")
@@ -165,12 +173,13 @@ def main():
         "train ids: %d  val ids: %d  views_per_sample_train: %d",
         len(train_ids), len(val_ids), view_cfg.views_per_sample_train,
     )
+    # deterministic=True everywhere (train and val): always the first views_per_sample
+    # rendered views per id, not a random subset — simpler to reason about, and keeps every
+    # epoch's view selection identical instead of jittering across steps/epochs.
     train_set = CADImagePairDataset(
         cfg, ids=train_ids, image_transform=model.preprocess,
-        views_per_sample=view_cfg.views_per_sample_train, seed=RANDOM_SEED,
+        views_per_sample=view_cfg.views_per_sample_train, deterministic=True,
     )
-    # deterministic=True: always the same rendered view per id, so val loss/recall are
-    # comparable across epochs instead of jittering with a randomly chosen view.
     val_set = CADImagePairDataset(cfg, ids=val_ids, image_transform=model.preprocess, deterministic=True)
 
     pin_memory = device.type == "cuda"

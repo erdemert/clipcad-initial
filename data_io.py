@@ -1,5 +1,7 @@
+import hashlib
 import io
 import itertools
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -9,9 +11,11 @@ import h5py
 import numpy as np
 from PIL import Image
 
-from config import PathConfig
+from config import PACKAGE_ROOT, PathConfig
 
 logger = logging.getLogger(__name__)
+
+_PAIRED_IDS_CACHE_DIR = PACKAGE_ROOT / ".cache"
 
 # Per-process, size-capped LRU cache of open shard image stores:
 # {(images_root, shard): (h5py.File, id_to_row)}. Populated lazily from
@@ -89,6 +93,11 @@ def _shard_paired_ids(shard_dir, cfg: PathConfig):
     return paired, True
 
 
+def _paired_ids_cache_path(cfg: PathConfig):
+    key = hashlib.sha256(f"{cfg.cad_vec_root}|{cfg.images_root}".encode()).hexdigest()[:16]
+    return _PAIRED_IDS_CACHE_DIR / f"paired_ids_{key}.json"
+
+
 def list_paired_ids(cfg: PathConfig) -> list[str]:
     """Return ids that have both a cad_vec file and a rendered-image row in the shard's h5.
 
@@ -101,12 +110,23 @@ def list_paired_ids(cfg: PathConfig) -> list[str]:
     listing (`glob("*.h5")`) can itself be the expensive part on a network-mounted filesystem —
     not just opening the shard's image h5.
 
-    Uses a process pool, not a thread pool: h5py serializes essentially every call into the
-    HDF5 C library through one process-wide lock (its "Phil" lock, since the underlying HDF5
-    library isn't thread-safe), so threads calling h5py.File(...) concurrently still run those
-    opens one at a time — measured in production at ~30s/shard whether "concurrent" or not.
-    Separate processes each get their own independent lock, so this actually parallelizes.
+    Runs the per-shard scan through a process pool. Measured in production: switching from a
+    thread pool to a process pool made no difference at all (~30s/shard either way, ~100 shards
+    scanned serialized in wall-clock terms) — so this isn't a client-side GIL/lock contention
+    issue, it's most likely the network-mounted storage itself (bandwidth or server-side
+    request serialization) that caps this regardless of client concurrency. Since that means
+    no amount of parallelism here fixes the wall-clock cost, and this scan is deterministic for
+    a fixed dataset, the result is cached to disk (keyed by cad_vec_root/images_root) so repeat
+    runs against the same data skip the ~1hr scan entirely. Delete the cache file under
+    PACKAGE_ROOT/.cache/ (logged below) if the underlying rendered data changes.
     """
+    cache_path = _paired_ids_cache_path(cfg)
+    if cache_path.is_file():
+        with open(cache_path) as f:
+            ids = json.load(f)["ids"]
+        logger.info("list_paired_ids: loaded %d cached ids from %s (delete this file to rescan)", len(ids), cache_path)
+        return ids
+
     t0 = time.monotonic()
     shard_dirs = [d for d in sorted(cfg.cad_vec_root.iterdir()) if d.is_dir()]
     t1 = time.monotonic()
@@ -129,6 +149,11 @@ def list_paired_ids(cfg: PathConfig) -> list[str]:
     ids = []
     for paired, _ in results:
         ids.extend(paired)
+
+    _PAIRED_IDS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump({"cad_vec_root": str(cfg.cad_vec_root), "images_root": str(cfg.images_root), "ids": ids}, f)
+    logger.info("list_paired_ids: cached %d ids to %s", len(ids), cache_path)
     return ids
 
 

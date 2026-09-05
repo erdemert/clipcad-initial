@@ -1,6 +1,5 @@
 import argparse
 import logging
-import random
 from datetime import datetime
 from pathlib import Path
 
@@ -9,7 +8,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from cad_vec_similarity import DEFAULT_CONFIG, cad_similarity, load_cad_vector
-from config import RANDOM_SEED, CheckpointConfig, PathConfig, ViewConfig
+from config import CheckpointConfig, PathConfig, ViewConfig
 from data_io import list_views
 from dataset import CADImagePairDataset
 from metrics import evaluate_recall
@@ -52,24 +51,27 @@ def embed_split(model, cfg, ids, device):
     return torch.cat(image_embeds), torch.cat(cad_embeds), ordered_ids
 
 
-def sample_views_per_id(ids, cfg, n_views, seed):
-    """Return an expanded (id, view) list: n_views independently sampled views per id."""
-    rng = random.Random(seed)
+def sample_views_per_id(ids, cfg, n_views):
+    """Return an expanded (id, view) list: the first n_views rendered views per id.
+
+    Deterministic (first n_views, not a random subset) so results are directly comparable
+    across checkpoints/runs without needing to fix a seed.
+    """
     expanded = []
     for sample_id in ids:
         views = list_views(sample_id, cfg)
         k = min(n_views, len(views))
-        expanded.extend((sample_id, view) for view in rng.sample(views, k))
+        expanded.extend((sample_id, view) for view in views[:k])
     return expanded
 
 
-def evaluate_multiview_recall(model, cfg, ids, cad_embeds, device, n_views, seed, ks=(1, 5, 10)):
-    """Recall@K sampling n_views independent renders per model; each view is its own query row.
+def evaluate_multiview_recall(model, cfg, ids, cad_embeds, device, n_views, ks=(1, 5, 10)):
+    """Recall@K over the first n_views renders per model; each view is its own query row.
 
     ids/cad_embeds must already be aligned (cad_embeds[i] is the gallery entry for ids[i]) —
     the sampled views are additional, independent image queries against that same gallery.
     """
-    expanded_ids = sample_views_per_id(ids, cfg, n_views, seed)
+    expanded_ids = sample_views_per_id(ids, cfg, n_views)
     dataset = CADImagePairDataset(cfg, ids=expanded_ids, image_transform=model.preprocess)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
@@ -182,11 +184,11 @@ def main():
                 image_embeds, cad_embeds, ordered_ids, vec_caches[name],
                 ks=tuple(args.ks), threshold=args.threshold,
             )
-            # same fixed seed on every checkpoint: all checkpoints in a sweep are scored
-            # against the identical sampled views, so results stay comparable across epochs.
+            # deterministic (first n_views per id): every checkpoint in a sweep is scored
+            # against the identical views, so results stay comparable across epochs.
             multiview_recalls, _ = evaluate_multiview_recall(
                 model, cfg, ordered_ids, cad_embeds, device,
-                n_views=view_cfg.views_per_query_inference, seed=RANDOM_SEED, ks=tuple(args.ks),
+                n_views=view_cfg.views_per_query_inference, ks=tuple(args.ks),
             )
 
             for k, v in exact_recalls.items():
