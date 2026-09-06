@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -22,22 +23,26 @@ from splits import load_train_val_ids
 
 NUM_EPOCHS = 150
 # Sized against BOTH GPU and host RAM, not just host RAM (see git history for the host-only
-# version that still OOM'd on GPU). With views_per_sample_train=42, N = BATCH_SIZE x 42 images
-# go through the image tower together each step.
+# version that still OOM'd on GPU). N = BATCH_SIZE x views_per_sample_train images go through
+# the image tower together each step (now views_per_sample_train=3, not 42 — see config.py).
 #   - GPU: gradient-checkpointing the visual tower (see model.py) still needs each of its 5
-#     checkpointed segments' boundary-input tensors held live for recomputation during
-#     backward (~N x (64x112x112 + 64x112x112 + 256x56x56 + 512x28x28 + 1024x14x14) x 4B),
-#     plus backward-pass gradients of similar magnitude — confirmed in production: at
-#     BATCH_SIZE=64 (N=2688) this hit ~78GB used out of 85GB, and a CUDA OOM warning's byte
-#     count matched N x 64 x 112 x 112 x 4B (the stem output tensor) exactly. Since this scales
-#     ~linearly with N, BATCH_SIZE=32 (N=1344) roughly halves it to a much safer ~39GB.
-#   - Host RAM: one collated image batch is BATCH_SIZE x 42 x 3 x 224 x 224 x 4B ~=
-#     BATCH_SIZE x 25.3MB, and the DataLoader can buffer up to
-#     NUM_WORKERS x TRAIN_PREFETCH_FACTOR batches ahead of the training loop — worst case
-#     ~26GB at 32/32/1 (BATCH_SIZE/NUM_WORKERS/TRAIN_PREFETCH_FACTOR), comfortably under
-#     train.slurm's --mem-per-gpu=128G (a cluster-imposed ceiling, not adjustable further).
-BATCH_SIZE = 32
-TRAIN_PREFETCH_FACTOR = 1
+#     checkpointed segments' boundary-input tensors held live for recomputation during backward,
+#     plus backward-pass gradients of similar magnitude. Empirically calibrated against the one
+#     production data point we have (BATCH_SIZE=64, views=42, N=2688 -> ~78GB used of 85GB total,
+#     confirmed via a CUDA OOM warning whose byte count matched the stem-output tensor size
+#     exactly) gives ~0.029GB used per image-in-batch, all-inclusive. At views=3, BATCH_SIZE=512
+#     (N=1536) extrapolates to ~45GB — good headroom under 85GB while still much bigger than the
+#     32 used when views_per_sample_train was still 42.
+#   - Host RAM: one collated image batch is BATCH_SIZE x views_per_sample_train x 3 x 224 x 224 x
+#     4B, and the DataLoader can buffer up to NUM_WORKERS x TRAIN_PREFETCH_FACTOR batches ahead
+#     of the training loop — worst case ~30GB at 512/32/1 (BATCH_SIZE/NUM_WORKERS/
+#     TRAIN_PREFETCH_FACTOR), still comfortably under train.slurm's --mem-per-gpu=128G (a
+#     cluster-imposed ceiling, not adjustable further) even at TRAIN_PREFETCH_FACTOR=2 (~60GB) —
+#     bumped back to the PyTorch default now that there's headroom, since deeper prefetch can
+#     help hide the data_time cost that's the suspected throughput bottleneck (see run_epoch's
+#     data_time/compute_time log split).
+BATCH_SIZE = 512
+TRAIN_PREFETCH_FACTOR = 2
 LR = 1e-4
 RUNS_DIR = Path("runs")
 LOG_EVERY_N_STEPS = 20
@@ -96,7 +101,25 @@ def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None, 
     n_batches_total = len(loader)
     total_loss, n_batches = 0.0, 0
     image_embeds, cad_embeds = [], []
-    for step, batch in enumerate(loader):
+
+    # Separately timed so a slow step's cause is visible in the log: data_time is time spent
+    # waiting on the DataLoader (workers fetching/decoding images from the network-mounted
+    # store — the suspected bottleneck given how slow shard access has been elsewhere in this
+    # pipeline); compute_time is the forward/backward/optimizer step. Windowed (reset every
+    # LOG_EVERY_N_STEPS) rather than a whole-epoch running average, so a transient stall shows
+    # up at the step where it happened instead of being smeared across the whole epoch.
+    window_data_time, window_compute_time = 0.0, 0.0
+    loader_iter = iter(loader)
+    step = 0
+    while True:
+        t0 = time.monotonic()
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            break
+        t1 = time.monotonic()
+        window_data_time += t1 - t0
+
         image = batch["image"].to(device, non_blocking=True)
         command = batch["command"].to(device, non_blocking=True)
         args = batch["args"].to(device, non_blocking=True)
@@ -129,16 +152,26 @@ def run_epoch(model, loader, device, epoch, phase, optimizer=None, writer=None, 
             image_embeds.append(image_emb.detach().float().cpu())
             cad_embeds.append(cad_emb.detach().float().cpu())
 
+        # loss.item() above (or below, if not is_train) already forces a CUDA sync, so this
+        # captures true GPU completion time, not just kernel-launch time.
         total_loss += loss.item()
         n_batches += 1
+        t2 = time.monotonic()
+        window_compute_time += t2 - t1
 
         if step % LOG_EVERY_N_STEPS == 0:
             host_rss_gb = _host_rss_gb()
             rss_str = f"  host_rss {host_rss_gb:.1f}GB" if host_rss_gb is not None else ""
+            n_since_log = min(step, LOG_EVERY_N_STEPS) or 1
             logger.info(
-                "epoch %03d  %s  step %d/%d  loss %.4f  running_avg %.4f%s",
-                epoch, phase, step, n_batches_total, loss.item(), total_loss / n_batches, rss_str,
+                "epoch %03d  %s  step %d/%d  loss %.4f  running_avg %.4f  "
+                "data_time %.2fs/step  compute_time %.2fs/step%s",
+                epoch, phase, step, n_batches_total, loss.item(), total_loss / n_batches,
+                window_data_time / n_since_log, window_compute_time / n_since_log, rss_str,
             )
+            window_data_time, window_compute_time = 0.0, 0.0
+
+        step += 1
 
     avg_loss = total_loss / n_batches
     if writer is not None:
