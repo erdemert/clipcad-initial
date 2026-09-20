@@ -510,6 +510,31 @@ def cad_similarity(
     return float(np.clip(similarity, 0.0, 1.0))
 
 
+def pairwise_similarity_matrix(
+    vecs,
+    cfg: CADSimilarityConfig = DEFAULT_CONFIG,
+) -> np.ndarray:
+    """Dense N x N CAD-similarity matrix for a batch of raw (seq_len, 1+N_ARGS) vectors.
+
+    Used as the regression target for cad_similarity_matching_loss (see losses.py). Diagonal
+    is always 1.0 (a CAD is maximally similar to itself, by construction of cad_similarity)
+    and the matrix is symmetric, so only the upper triangle is computed and mirrored.
+
+    Expensive: cad_distance is a pure-Python O(seq_len^2) edit-distance DP per pair, not
+    vectorized, so this is O(N^2) Python-level calls — fine for a few dozen samples, but a
+    real bottleneck at batch sizes in the hundreds. Only use the cad_guided loss with a small
+    batch size.
+    """
+    n = len(vecs)
+    sim = np.eye(n, dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = cad_similarity(vecs[i], vecs[j], cfg)
+            sim[i, j] = s
+            sim[j, i] = s
+    return sim
+
+
 # ============================================================
 # H5 convenience wrapper
 # ============================================================

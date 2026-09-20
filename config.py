@@ -5,8 +5,8 @@ from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 
-# Seeds every random operation (view sampling during training and the multi-view
-# inference sweep) so runs are reproducible given the same seed.
+# Seeds every random operation (view sampling during training) so runs are reproducible
+# given the same seed.
 RANDOM_SEED = int(os.environ.get("CAD_CLIPPER_SEED", "42"))
 
 
@@ -34,25 +34,24 @@ class PathConfig:
 
 
 @dataclass(frozen=True)
-class ViewConfig:
-    views_per_sample_train: int
-    views_per_query_inference: int
+class LossConfig:
+    loss_type: str  # "clip" or "cad_guided"
+    cad_guided_beta: float
 
     @classmethod
-    def default(cls) -> "ViewConfig":
-        # 3 of 42 rendered angles per training sample — N = BATCH_SIZE x views_per_sample_train
-        # images go through the image tower together each training step, and that N drove the
-        # GPU/host OOMs fixed earlier by cutting BATCH_SIZE; cutting this further gives a much
-        # larger safety margin (N=32*3=96, vs 32*42=1344 originally) and also directly cuts the
-        # per-step image-loading volume, the suspected dominant cost in the data_time/compute_time
-        # split now logged in train.py. Eval's multi-view sweep (views_per_query_inference) is
-        # unrelated to per-step training cost and stays at 42.
-        views_per_sample_train = int(os.environ.get("CAD_CLIPPER_VIEWS_PER_SAMPLE_TRAIN", "3"))
-        views_per_query_inference = int(os.environ.get("CAD_CLIPPER_VIEWS_PER_QUERY_INFERENCE", "42"))
-        return cls(
-            views_per_sample_train=views_per_sample_train,
-            views_per_query_inference=views_per_query_inference,
-        )
+    def default(cls) -> "LossConfig":
+        # "cad_guided" ADDS an auxiliary CAD-similarity-matching regularizer on top of the
+        # unchanged clip_contrastive_loss (see losses.cad_similarity_matching_loss): total =
+        # clip_loss + cad_guided_beta * matching_loss. Fully decoupled/additive, not a
+        # replacement for "clip" — cad_guided_beta=0 is exactly plain CLIP training. Building
+        # the similarity matrix is O(batch_size^2) pure-Python edit-distance calls
+        # (cad_vec_similarity.cad_distance isn't vectorized), so only select "cad_guided" with
+        # a small BATCH_SIZE in train.py.
+        loss_type = os.environ.get("CAD_CLIPPER_LOSS_TYPE", "clip")
+        if loss_type not in ("clip", "cad_guided"):
+            raise ValueError(f"CAD_CLIPPER_LOSS_TYPE must be 'clip' or 'cad_guided', got {loss_type!r}")
+        cad_guided_beta = float(os.environ.get("CAD_CLIPPER_CAD_GUIDED_BETA", "1.0"))
+        return cls(loss_type=loss_type, cad_guided_beta=cad_guided_beta)
 
 
 @dataclass(frozen=True)

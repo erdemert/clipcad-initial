@@ -11,23 +11,25 @@ def clip_contrastive_loss(logits_per_image, logits_per_cad):
     return (loss_i + loss_c) / 2
 
 
-def multiview_contrastive_loss(cad_emb, image_emb, n_views, logit_scale):
-    """Symmetric InfoNCE generalized to n_views independently-encoded images per CAD model.
+def cad_similarity_matching_loss(image_emb, cad_emb, cad_similarity_matrix):
+    """Auxiliary regularizer: predicted embedding similarity should track real CAD similarity.
 
-    cad_emb: (N, D) one embedding per sample. image_emb: (N * n_views, D), the n_views images
-    for sample i occupying rows [i*n_views, (i+1)*n_views) (see how `flat` is built in train.py) —
-    no pooling, each view is scored on its own. CAD->image has n_views positives per row, so that
-    direction is averaged over per-positive cross-entropies (equivalent to SupCon's multi-positive
-    loss); image->CAD has exactly one positive per row, so it's a plain single-label cross-entropy.
+    Decoupled from clip_contrastive_loss entirely — meant to be ADDED to it with a small
+    weight, not used alone: total = clip_contrastive_loss(...) + beta * this(...). At beta=0
+    training is exactly plain CLIP, since this term is fully additive; it never touches
+    clip_contrastive_loss's targets or gradients directly, only adds its own.
+
+    image_emb, cad_emb: (N, D), L2-normalized, so image_emb @ cad_emb.t() is already cosine
+    similarity in [-1, 1]. Remapped to [0, 1] to match cad_similarity_matrix's range before
+    comparing, since cad_similarity (see cad_vec_similarity.py) is defined on [0, 1] (1.0 =
+    identical CAD, -> 0 = maximally different) and is never negative.
+
+    cad_similarity_matrix: (N, N), symmetric, 1.0 on the diagonal, same device/dtype as the
+    embeddings (build via cad_vec_similarity.pairwise_similarity_matrix, then
+    torch.as_tensor(..., device=..., dtype=...)). No separate image->cad / cad->image split
+    needed (unlike the cross-entropy losses above) since this is a plain elementwise
+    regression over the full matrix, which already covers both directions.
     """
-    n = cad_emb.shape[0]
-    logits_per_cad = logit_scale * cad_emb @ image_emb.t()  # (N, N * n_views)
-
-    match_mask = torch.repeat_interleave(torch.eye(n, device=cad_emb.device), n_views, dim=1)
-    targets_cad_to_image = match_mask / match_mask.sum(dim=1, keepdim=True)
-    loss_cad = F.cross_entropy(logits_per_cad, targets_cad_to_image)
-
-    labels_image_to_cad = torch.arange(n, device=cad_emb.device).repeat_interleave(n_views)
-    loss_image = F.cross_entropy(logits_per_cad.t(), labels_image_to_cad)
-
-    return (loss_cad + loss_image) / 2
+    predicted_similarity = image_emb @ cad_emb.t()
+    predicted_similarity_01 = (predicted_similarity + 1) / 2
+    return F.mse_loss(predicted_similarity_01, cad_similarity_matrix)
