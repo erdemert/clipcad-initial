@@ -1,5 +1,6 @@
 import argparse
 import logging
+import random
 from datetime import datetime
 from pathlib import Path
 
@@ -8,7 +9,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from cad_vec_similarity import DEFAULT_CONFIG, cad_similarity, load_cad_vector
-from config import CheckpointConfig, PathConfig
+from config import RANDOM_SEED, CheckpointConfig, PathConfig
+from data_io import list_views
 from dataset import CADImagePairDataset
 from metrics import evaluate_recall
 from model import CADClipModel
@@ -32,7 +34,12 @@ def discover_epoch_checkpoints(checkpoint_dir: Path):
 
 
 def embed_split(model, cfg, ids, device):
-    """Run the trained encoders once over a split, returning embeddings aligned with ids."""
+    """Run the trained encoders once over a split, returning embeddings aligned with ids.
+
+    ids may be bare sample ids (each queried with its canonical/first view) or explicit
+    (sample_id, view) pairs (each queried with that specific view) — see
+    CADImagePairDataset and altered_view_ids below.
+    """
     dataset = CADImagePairDataset(cfg, ids=ids, image_transform=model.preprocess, deterministic=True)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
@@ -48,6 +55,24 @@ def embed_split(model, cfg, ids, device):
             ordered_ids.extend(batch["id"])
 
     return torch.cat(image_embeds), torch.cat(cad_embeds), ordered_ids
+
+
+def altered_view_ids(ids, cfg, seed):
+    """Pair each id with a view chosen uniformly at random from its NON-canonical views
+    (index 1+) — same exact CAD model, a different camera angle than "the" (index 0) image.
+
+    Fixed by `seed` (not re-randomized per call) so every checkpoint in a sweep is scored
+    against the identical "altered" query set — otherwise recall differences across epochs
+    would be confounded by which random views got picked, not just by the model improving.
+    Falls back to the only available view for any sample that doesn't have more than one.
+    """
+    rng = random.Random(seed)
+    expanded = []
+    for sample_id in ids:
+        views = list_views(sample_id, cfg)
+        candidates = views[1:] if len(views) > 1 else views
+        expanded.append((sample_id, rng.choice(candidates)))
+    return expanded
 
 
 def cad_vector_cache(cfg):
@@ -139,24 +164,29 @@ def main():
         logger.info("evaluating checkpoint %s (epoch %s)", ckpt_path, step)
 
         for name, ids in splits.items():
-            image_embeds, cad_embeds, ordered_ids = embed_split(model, cfg, ids, device)
-            exact_recalls, _ = evaluate_recall(image_embeds, cad_embeds)
-            loose_recalls = evaluate_loose_recall(
-                image_embeds, cad_embeds, ordered_ids, vec_caches[name],
-                ks=tuple(args.ks), threshold=args.threshold,
-            )
+            # canonical: each model's image[0]. altered: a reproducible random choice among
+            # each model's OTHER views (1+) — same seed every checkpoint, so results are
+            # comparable across a sweep (see altered_view_ids).
+            view_conditions = {"canonical": ids, "altered": altered_view_ids(ids, cfg, seed=RANDOM_SEED)}
+            for view_label, condition_ids in view_conditions.items():
+                image_embeds, cad_embeds, ordered_ids = embed_split(model, cfg, condition_ids, device)
+                exact_recalls, _ = evaluate_recall(image_embeds, cad_embeds)
+                loose_recalls = evaluate_loose_recall(
+                    image_embeds, cad_embeds, ordered_ids, vec_caches[name],
+                    ks=tuple(args.ks), threshold=args.threshold,
+                )
 
-            for k, v in exact_recalls.items():
-                writer.add_scalar(f"{name}/recall_top{k}", v, step)
-            for k, v in loose_recalls.items():
-                writer.add_scalar(f"{name}/loose_recall_top{k}", v, step)
+                for k, v in exact_recalls.items():
+                    writer.add_scalar(f"{name}_{view_label}/recall_top{k}", v, step)
+                for k, v in loose_recalls.items():
+                    writer.add_scalar(f"{name}_{view_label}/loose_recall_top{k}", v, step)
 
-            logger.info(
-                "[%s] epoch %s  n=%d  exact_recall=%s  loose_recall=%s",
-                name, step, len(ordered_ids),
-                {k: round(v, 4) for k, v in exact_recalls.items()},
-                {k: round(v, 4) for k, v in loose_recalls.items()},
-            )
+                logger.info(
+                    "[%s/%s] epoch %s  n=%d  exact_recall=%s  loose_recall=%s",
+                    name, view_label, step, len(ordered_ids),
+                    {k: round(v, 4) for k, v in exact_recalls.items()},
+                    {k: round(v, 4) for k, v in loose_recalls.items()},
+                )
         writer.flush()
 
     writer.close()
