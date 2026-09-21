@@ -28,7 +28,10 @@ CAD_GUIDED_BATCH_SIZE_WARNING_THRESHOLD = 64
 
 NUM_EPOCHS = 150
 # Sized against BOTH GPU and host RAM (back to single-view: N = BATCH_SIZE images go through
-# the image tower together each step, one view per sample, no multiview batching).
+# the image tower together each step, one view per sample, no multiview batching). Override
+# via CAD_CLIPPER_BATCH_SIZE — e.g. lower it when running loss_type=cad_guided, whose
+# similarity matrix is O(batch_size^2) pure-Python edit-distance calls (see
+# CAD_GUIDED_BATCH_SIZE_WARNING_THRESHOLD below).
 #   - GPU: gradient-checkpointing the visual tower (see model.py) still needs each of its 5
 #     checkpointed segments' boundary-input tensors held live for recomputation during backward,
 #     plus backward-pass gradients of similar magnitude. Empirically calibrated against the one
@@ -40,7 +43,7 @@ NUM_EPOCHS = 150
 #     can buffer up to NUM_WORKERS x TRAIN_PREFETCH_FACTOR batches ahead of the training loop —
 #     comfortably under train.slurm's --mem-per-gpu=128G (a cluster-imposed ceiling, not
 #     adjustable further) even at TRAIN_PREFETCH_FACTOR=2, the PyTorch default.
-BATCH_SIZE = 512
+BATCH_SIZE = int(os.environ.get("CAD_CLIPPER_BATCH_SIZE", "512"))
 TRAIN_PREFETCH_FACTOR = 2
 LR = 1e-4
 RUNS_DIR = Path("runs")
@@ -208,7 +211,7 @@ def main():
         logger.warning(
             "loss_type=cad_guided with BATCH_SIZE=%d: its similarity matrix is O(batch_size^2) "
             "pure-Python edit-distance calls (see cad_vec_similarity.pairwise_similarity_matrix) "
-            "and will likely dominate step time above ~%d — consider a much smaller BATCH_SIZE.",
+            "and will likely dominate step time above ~%d — set a lower CAD_CLIPPER_BATCH_SIZE.",
             BATCH_SIZE, CAD_GUIDED_BATCH_SIZE_WARNING_THRESHOLD,
         )
     model = CADClipModel(image_model_name="RN50", image_pretrained="openai").to(device)

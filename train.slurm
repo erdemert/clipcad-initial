@@ -18,6 +18,10 @@ set -euo pipefail
 # CAD_CLIPPER_CAD_GUIDED_BETA, which override the hardcoded defaults below — so
 # `sbatch --export=ALL,CAD_CLIPPER_CAD_GUIDED_BETA=0.3 train.slurm cad_guided` also works
 # (env var wins over the default, positional arg wins over the env var).
+#
+# train.py's BATCH_SIZE defaults to 512 (sized for clip) but reads CAD_CLIPPER_BATCH_SIZE if
+# set — lower it for cad_guided, whose per-step cost is O(batch_size^2):
+# `sbatch --export=ALL,CAD_CLIPPER_BATCH_SIZE=32 train.slurm cad_guided`
 export CAD_CLIPPER_LOSS_TYPE="${1:-${CAD_CLIPPER_LOSS_TYPE:-clip}}"
 export CAD_CLIPPER_CAD_GUIDED_BETA="${2:-${CAD_CLIPPER_CAD_GUIDED_BETA:-1.0}}"
 
